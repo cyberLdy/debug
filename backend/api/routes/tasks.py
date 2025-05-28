@@ -232,17 +232,27 @@ async def cancel_task(
 
         print(f"🛑 Cancelling task {task_id} in {task['status']} state")
 
-        # Update task status immediately
-        await db.tasks.update_one(
-            {"_id": ObjectId(task_id)},
+        # Update task status using atomic operation to prevent race conditions
+        result = await db.tasks.find_one_and_update(
+            {
+                "_id": ObjectId(task_id),
+                "status": {"$nin": ["done", "error"]}
+            },
             {
                 "$set": {
                     "status": "error",
                     "error": "Task cancelled by user",
                     "completedAt": datetime.utcnow()
                 }
-            }
+            },
+            return_document=True
         )
+
+        if not result:
+            raise HTTPException(
+                status_code=409,
+                detail="Task status changed during cancellation attempt"
+            )
 
         print(f"✅ Task {task_id} cancelled")
         
@@ -282,15 +292,32 @@ async def get_task(
             }
         ]).to_list(length=1)
 
-        # Get article count for verification
-        article_count = await db.articles.count_documents({"taskId": task_id})
+        # Count processed articles (actual count from results collection)
+        processed_count = await db.screening_results.count_documents({"taskId": task_id})
+        
+        # Get total article count
+        total_article_count = await db.articles.count_documents({"taskId": task_id})
+
+        # Make sure progress is consistent with processed articles
+        if task.get("progress", {}).get("current", 0) != processed_count:
+            # Update task with correct progress
+            await db.tasks.update_one(
+                {"_id": ObjectId(task_id)},
+                {"$set": {"progress.current": processed_count}}
+            )
+            # Update the in-memory task object as well
+            if "progress" in task:
+                task["progress"]["current"] = processed_count
+            else:
+                task["progress"] = {"current": processed_count, "total": total_article_count}
 
         # Add article count to response
         task_response = {
             **task,
             "_id": str(task["_id"]),
             "stats": stats[0] if stats else {"included": 0, "excluded": 0},
-            "articleCount": article_count
+            "articleCount": total_article_count,
+            "processedCount": processed_count
         }
 
         return {
@@ -342,8 +369,13 @@ async def list_tasks(
                 }
             ]).to_list(length=1)
             
+            # Count processed articles for each task
+            processed_count = await db.screening_results.count_documents({"taskId": str(task["_id"])})
+            
+            # Update the task object
             task["_id"] = str(task["_id"])
             task["stats"] = stats[0] if stats else {"included": 0, "excluded": 0}
+            task["processedCount"] = processed_count
 
         return {
             "success": True,

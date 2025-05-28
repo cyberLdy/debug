@@ -79,19 +79,33 @@ class TaskManager:
         if completion_time:
             update["completedAt"] = completion_time
 
-        await self.db.tasks.update_one(
-            {"_id": ObjectId(task_id)},
+        # Use atomic update to ensure we only update if status hasn't changed
+        result = await self.db.tasks.update_one(
+            {
+                "_id": ObjectId(task_id),
+                "status": current_status  # Only update if status hasn't changed
+            },
             {"$set": update}
         )
 
-        print(f"✅ Task {task_id} marked as {final_status}")
-        print(f"Final progress: {total_processed}/{task['progress']['total']} articles")
+        if result.modified_count == 1:
+            print(f"✅ Task {task_id} marked as {final_status}")
+            print(f"Final progress: {total_processed}/{task['progress']['total']} articles")
+        else:
+            print(f"⚠️ Task {task_id} status changed externally, could not update to {final_status}")
+            # Re-load task to log current status
+            current_task = await self.load_task(task_id)
+            if current_task:
+                print(f"Current task status is: {current_task.get('status', 'unknown')}")
 
     async def mark_task_error(self, task_id: str, error_message: str):
         """Mark task as error with message"""
         print(f"\n❌ Marking task {task_id} as error: {error_message}")
-        await self.db.tasks.update_one(
-            {"_id": ObjectId(task_id)},
+        result = await self.db.tasks.update_one(
+            {
+                "_id": ObjectId(task_id),
+                "status": {"$nin": ["done"]}  # Don't override done status
+            },
             {
                 "$set": {
                     "status": "error",
@@ -101,3 +115,9 @@ class TaskManager:
                 }
             }
         )
+        
+        if result.modified_count == 0:
+            print(f"⚠️ Could not update task {task_id} to error state - status may have been changed externally")
+            current_task = await self.load_task(task_id)
+            if current_task:
+                print(f"Current task status is: {current_task.get('status', 'unknown')}")

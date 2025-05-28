@@ -1,5 +1,4 @@
 # worker.py
-# Add at the top of worker.py
 from datetime import datetime, timedelta
 from typing import Optional, Set
 import asyncio
@@ -24,12 +23,29 @@ class Worker:
         self._processing_tasks: set[str] = set()        # Track tasks in flight
         self._error_counts: dict[str, int] = {}         # Track per‑task errors
         self._config_check_interval = 5                 # Seconds
+        self._initialized = False                       # Track initialization state
 
     async def start(self):
         """Main worker loop."""
         print("🚀 Starting screening worker...")
         self.running = True
         self._shutdown.clear()
+
+        # Pre-initialize components
+        if not self._initialized:
+            try:
+                print("⚙️ Pre-initializing worker components...")
+                # Initialize LLM service
+                await self.task_processor.screening_service.llm_service.initialize()
+                print("✅ LLM service initialized")
+                
+                # Wait a moment to ensure everything is ready
+                await asyncio.sleep(1)
+                self._initialized = True
+                print("✅ Worker fully initialized and ready")
+            except Exception as e:
+                print(f"⚠️ Warning: Error during pre-initialization: {e}")
+                # Continue anyway - non-fatal
 
         last_config_check = 0.0
 
@@ -101,6 +117,13 @@ class Worker:
                         self._processing_tasks.add(task_id)
                         self.current_task = task_id
                         print(f"📝 Processing task: {task_id} (Status: {current['status']})")
+                        
+                        # Ensure initialization before each task (safety check)
+                        if not self._initialized:
+                            print("⚙️ Initializing components before processing task...")
+                            await self.task_processor.screening_service.llm_service.initialize()
+                            self._initialized = True
+                            
                         await self.task_processor.process(task_id)
 
                         # Check if task was paused - if so, log it
@@ -140,6 +163,13 @@ class Worker:
         print("🛑 Stopping worker...")
         self._shutdown.set()
         self.running = False
+
+        # Clean up resources
+        try:
+            await self.task_processor.screening_service.llm_service.cleanup()
+            print("✅ LLM service cleaned up")
+        except Exception as e:
+            print(f"⚠️ Error cleaning up LLM service: {e}")
 
         for task_id in list(self._processing_tasks):
             print(f"🔄 Cancelling task: {task_id}")

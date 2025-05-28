@@ -31,9 +31,12 @@ class ArticleProcessor:
             remaining_articles = []
             process_total = total_articles
         
-        # Update task with remaining articles and total
-        await self.db.tasks.update_one(
-            {"_id": ObjectId(task_id)},
+        # Update task with remaining articles and total - use atomic update
+        result = await self.db.tasks.update_one(
+            {
+                "_id": ObjectId(task_id),
+                "status": task.get("status")  # Only update if status hasn't changed
+            },
             {
                 "$set": {
                     "remainingArticles": remaining_articles,
@@ -43,6 +46,9 @@ class ArticleProcessor:
                 }
             }
         )
+        
+        if result.modified_count != 1:
+            print(f"⚠️ Warning: Task {task_id} status changed during preparation")
 
         print(f"Processing {len(articles_to_process)} articles")
         if remaining_articles:
@@ -102,8 +108,12 @@ class ArticleProcessor:
 
                 # For initial screening, check if we've reached the limit
                 if task["status"] == "running" and new_total >= settings.ARTICLE_LIMIT:
-                    await self.db.tasks.update_one(
-                        {"_id": ObjectId(task_id)},
+                    # Use atomic update to ensure we only change status if it's still "running"
+                    result = await self.db.tasks.update_one(
+                        {
+                            "_id": ObjectId(task_id),
+                            "status": "running"  # Only update if status is still running
+                        },
                         {
                             "$set": {
                                 "status": "paused",
@@ -112,12 +122,25 @@ class ArticleProcessor:
                             }
                         }
                     )
-                    print(f"⏸️ Initial screening limit reached - {new_total} articles processed")
+                    
+                    if result.modified_count == 1:
+                        print(f"⏸️ Initial screening limit reached - {new_total} articles processed")
+                    else:
+                        # Task status might have been changed externally
+                        current_task = await self.db.tasks.find_one({"_id": ObjectId(task_id)})
+                        if current_task:
+                            print(f"⚠️ Could not pause task - current status is {current_task.get('status', 'unknown')}")
+                        else:
+                            print("⚠️ Could not pause task - task not found")
+                    
                     return new_total
                 else:
-                    # Standard progress update
-                    await self.db.tasks.update_one(
-                        {"_id": ObjectId(task_id)},
+                    # Standard progress update - use atomic update to prevent race conditions
+                    result = await self.db.tasks.update_one(
+                        {
+                            "_id": ObjectId(task_id),
+                            "status": task["status"]  # Only update if status hasn't changed
+                        },
                         {
                             "$set": {
                                 "progress.current": new_total,
@@ -125,6 +148,9 @@ class ArticleProcessor:
                             }
                         }
                     )
+                    
+                    if result.modified_count != 1:
+                        print(f"⚠️ Warning: Could not update progress - task status may have changed")
 
                 # Small delay between updates
                 if idx < len(batch) - 1:

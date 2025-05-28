@@ -1,4 +1,3 @@
-
 import httpx
 import json
 import asyncio
@@ -13,6 +12,7 @@ class LLMService:
         self._max_retries = 2
         self._client: httpx.AsyncClient | None = None
         self._request_lock = asyncio.Lock()
+        self._score_threshold = 60  # New threshold for decision validation
 
     async def initialize(self):
         """Initialize HTTP client"""
@@ -150,6 +150,9 @@ class LLMService:
                         print(f"❌ Invalid JSON structure: {json_data}")
                         raise ValueError("Response must be a dictionary")
 
+                    # Validate and correct inconsistencies between score and decision
+                    json_data = self._validate_decisions(json_data)
+
                     # Validate required fields for each article
                     for article_id, result in json_data.items():
                         if not isinstance(result, dict):
@@ -163,18 +166,34 @@ class LLMService:
                             print(f"❌ Missing required fields for article {article_id}: {missing_fields}")
                             raise ValueError(f"Missing required fields: {', '.join(missing_fields)}")
 
-                        # Validate field types
-                        if not isinstance(result['included'], bool):
+                        # Validate field types with more explicit type handling
+                        # Handle 'included' field - convert strings "true"/"false" properly
+                        if isinstance(result['included'], str):
+                            result['included'] = result['included'].lower() == "true"
+                        elif not isinstance(result['included'], bool):
                             result['included'] = bool(result['included'])
+                            
+                        # Handle reason field
                         if not isinstance(result['reason'], str):
                             result['reason'] = str(result['reason'])
-                        if not isinstance(result['relevanceScore'], (int, float)):
+                            
+                        # Handle score - convert percentages, handle strings, etc.
+                        if isinstance(result['relevanceScore'], str):
+                            # Remove any % sign if present
+                            score_str = result['relevanceScore'].replace('%', '').strip()
+                            try:
+                                result['relevanceScore'] = float(score_str)
+                            except (ValueError, TypeError):
+                                print(f"⚠️ Could not parse score: {result['relevanceScore']}")
+                                result['relevanceScore'] = 0.0
+                        elif not isinstance(result['relevanceScore'], (int, float)):
                             try:
                                 result['relevanceScore'] = float(result['relevanceScore'])
                             except (ValueError, TypeError):
+                                print(f"⚠️ Could not convert score to float: {result['relevanceScore']}")
                                 result['relevanceScore'] = 0.0
 
-                        # Ensure score is within bounds
+                        # Ensure score is within bounds (0-100)
                         result['relevanceScore'] = max(0, min(100, float(result['relevanceScore'])))
 
                     print("\n✅ Final validated JSON:")
@@ -202,9 +221,75 @@ class LLMService:
             print(f"❌ Ollama API error: {str(e)}")
             raise
 
-    def _extract_json(self, content: str) -> Dict[str, Any]:
-
+    def _validate_decisions(self, json_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and correct inconsistencies between score and inclusion decision"""
+        print("\n🔍 Validating decision logic based on scores...")
+        corrections_made = False
         
+        for article_id, result in json_data.items():
+            if not isinstance(result, dict):
+                continue
+                
+            if 'relevanceScore' not in result or 'included' not in result:
+                continue
+                
+            # Convert score to float and round to handle potential floating point issues
+            try:
+                score = float(result['relevanceScore'])
+                score = round(score, 1)  # Round to 1 decimal place for stable comparison
+            except (ValueError, TypeError):
+                print(f"⚠️ Invalid score format for article {article_id}: {result['relevanceScore']}")
+                continue
+                
+            # Convert current_decision to boolean, handling string values like "true"/"false"
+            if isinstance(result['included'], str):
+                current_decision = result['included'].lower() == "true"
+            else:
+                current_decision = bool(result['included'])
+            
+            # Force exact comparison - article MUST be included if score >= threshold
+            # Print detailed debug info for every article regardless of correction
+            print(f"📊 Article {article_id}:")
+            print(f"   - Score: {score}")
+            print(f"   - Threshold: {self._score_threshold}")
+            print(f"   - Current decision: {'included' if current_decision else 'excluded'}")
+            
+            # Determine correct decision based on threshold
+            correct_decision = score >= self._score_threshold
+            
+            print(f"   - Correct decision should be: {'included' if correct_decision else 'excluded'}")
+            print(f"   - Need correction: {current_decision != correct_decision}")
+            
+            if current_decision != correct_decision:
+                old_decision = "included" if current_decision else "excluded"
+                new_decision = "included" if correct_decision else "excluded"
+                print(f"⚠️ CORRECTING decision-score mismatch for article {article_id}:")
+                print(f"   - Score: {score}")
+                print(f"   - Current decision: {old_decision}")
+                print(f"   - Corrected to: {new_decision}")
+                
+                # Update the decision - make sure it's a proper boolean
+                result['included'] = correct_decision
+                
+                # Update the reason prefix if needed
+                if 'reason' in result and isinstance(result['reason'], str):
+                    reason = result['reason']
+                    if reason.startswith("Included:") and not correct_decision:
+                        reason = "Excluded:" + reason[9:]
+                    elif reason.startswith("Excluded:") and correct_decision:
+                        reason = "Included:" + reason[9:]
+                    result['reason'] = reason
+                
+                corrections_made = True
+            
+        if corrections_made:
+            print("✅ Decision corrections applied based on score threshold")
+        else:
+            print("✓ No decision corrections needed, all decisions match scores")
+            
+        return json_data
+
+    def _extract_json(self, content: str) -> Dict[str, Any]:
         content = content.strip()
         
         # Try parsing as pure JSON first
