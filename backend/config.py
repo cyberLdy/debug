@@ -1,7 +1,9 @@
 from pydantic_settings import BaseSettings
+from typing import Optional
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import time
 from urllib.parse import urlparse
 
 env_path = Path(__file__).parent.parent / '.env'
@@ -9,21 +11,19 @@ load_dotenv(env_path)
 
 class Settings(BaseSettings):
     # MongoDB settings - these should never be modified by env reload
-    MONGODB_URI: str = os.getenv('MONGODB_URI', 'mongodb://devchat_user:future_456@10.14.16.60:5200/dongyu?authSource=admin')
+    MONGODB_URI: str = os.getenv('MONGODB_URI')
     MONGODB_DB: str = urlparse(MONGODB_URI).path.lstrip('/').split('?')[0]
     
     # LLM API settings - these can be reloaded
     OLLAMA_API_URL: str = os.getenv('NEXT_PUBLIC_OLLAMA_API_URL', '')
     OLLAMA_MODEL: str = os.getenv('NEXT_PUBLIC_OLLAMA_MODEL', '')
-
-    # Screening settings
-    ARTICLE_LIMIT: int = 10
     
     # Service settings
     BATCH_SIZE: int = 2
     MAX_RETRIES: int = 2
     RETRY_DELAY: int = 2
     REQUEST_TIMEOUT: int = 120
+    ARTICLE_LIMIT : int = 100
 
     # Track last env file modification time
     _env_mtime: float = 0
@@ -41,10 +41,9 @@ class Settings(BaseSettings):
                 # Load new environment variables
                 load_dotenv(env_path, override=True)
                 
-                # Update settings
+                # Only update LLM-related settings
                 self.OLLAMA_API_URL = os.getenv('NEXT_PUBLIC_OLLAMA_API_URL', self.OLLAMA_API_URL)
                 self.OLLAMA_MODEL = os.getenv('NEXT_PUBLIC_OLLAMA_MODEL', self.OLLAMA_MODEL)
-                self.ARTICLE_LIMIT = int(os.getenv('ARTICLE_LIMIT', str(self.ARTICLE_LIMIT)))
                 
                 # Update modification time
                 self._env_mtime = current_mtime
@@ -53,7 +52,6 @@ class Settings(BaseSettings):
                 print("📝 Current settings:")
                 print(f"  - Ollama URL: {self.OLLAMA_API_URL}")
                 print(f"  - Ollama Model: {self.OLLAMA_MODEL}")
-                print(f"  - Article Limit: {self.ARTICLE_LIMIT}")
                 return True
                 
             return False
