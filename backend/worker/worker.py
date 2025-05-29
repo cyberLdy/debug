@@ -1,12 +1,17 @@
-import asyncio
+# worker.py
 from datetime import datetime, timedelta
 from typing import Optional, Set
-from motor.motor_asyncio import AsyncIOMotorDatabase
+import asyncio
+import time
+from datetime import datetime, timedelta
+from typing import Optional
+
 from bson import ObjectId
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
 from .tasks import TaskProcessor
 from config import settings
-import time
-import uuid
+
 
 class Worker:
     def __init__(self, db: AsyncIOMotorDatabase):
@@ -15,189 +20,199 @@ class Worker:
         self.current_task: Optional[str] = None
         self.task_processor = TaskProcessor(db)
         self._shutdown = asyncio.Event()
-        self._processing_tasks: Set[str] = set()  # Track tasks being processed
-        self._error_counts = {}  # Track error counts per task
-        self._config_check_interval = 5  # Check config every 5 seconds
-        self._worker_id = str(uuid.uuid4())[:8]  # Unique worker ID
-        self._active_processors = {}  # Track active processors
+        self._processing_tasks: set[str] = set()        # Track tasks in flight
+        self._error_counts: dict[str, int] = {}         # Track per‑task errors
+        self._config_check_interval = 5                 # Seconds
+        self._initialized = False                       # Track initialization state
+        self._last_task_check = 0.0                    # Track last time we checked for tasks
 
     async def start(self):
-        """Start the worker process"""
-        print(f"🚀 Starting screening worker {self._worker_id}...")
+        """Main worker loop."""
+        print("🚀 Starting screening worker...")
         self.running = True
         self._shutdown.clear()
-        
-        last_config_check = 0
-        
+
+        # Pre-initialize components
+        if not self._initialized:
+            try:
+                print("⚙️ Pre-initializing worker components...")
+                # Initialize LLM service
+                await self.task_processor.screening_service.llm_service.initialize()
+                print("✅ LLM service initialized")
+                
+                # Wait a moment to ensure everything is ready
+                await asyncio.sleep(1)
+                self._initialized = True
+                print("✅ Worker fully initialized and ready")
+            except Exception as e:
+                print(f"⚠️ Warning: Error during pre-initialization: {e}")
+                # Continue anyway - non-fatal
+
+        last_config_check = 0.0
+        last_paused_log = 0.0
+
         while not self._shutdown.is_set():
             try:
-                # Check for configuration changes
-                current_time = time.time()
-                if current_time - last_config_check >= self._config_check_interval:
+                now_ts = time.time()
+                
+                # ── 1. Reload config if changed ────────────────────────────────
+                if now_ts - last_config_check >= self._config_check_interval:
                     if settings.reload_if_changed():
-                        print(f"⚡ Worker {self._worker_id} detected configuration changes")
-                    last_config_check = current_time
+                        print("⚡ Worker detected configuration changes")
+                    last_config_check = now_ts
 
-                # Find tasks that need processing
-                # Use findOneAndUpdate to atomically claim a task
-                task = await self.db.tasks.find_one_and_update(
+                # ── 2. Find runnable tasks (running / full_screening) ─────────
+                # Add a small delay to prevent rapid polling
+                if now_ts - self._last_task_check < 2.0:
+                    await asyncio.sleep(1)
+                    continue
+                    
+                self._last_task_check = now_ts
+
+                # Check for tasks that need processing
+                tasks = await self.db.tasks.find(
                     {
-                        "status": "running",
-                        "$or": [
-                            {"workerClaim": None},
-                            {"workerClaim": {"$exists": False}},
-                            {
-                                "workerClaim.claimedAt": {
-                                    "$lt": datetime.utcnow() - timedelta(minutes=5)
-                                }
-                            }
-                        ],
+                        "status": {"$in": ["running", "full_screening"]},
                         "_id": {
                             "$nin": [ObjectId(tid) for tid in self._processing_tasks]
                         }
-                    },
-                    {
-                        "$set": {
-                            "workerClaim": {
-                                "workerId": self._worker_id,
-                                "claimedAt": datetime.utcnow()
-                            }
-                        }
-                    },
-                    return_document=True
-                )
+                    }
+                ).sort("startedAt", 1).to_list(length=10)
 
-                if not task:
-                    # No tasks to process, wait before checking again
-                    await asyncio.sleep(2)
-                    continue
-
-                task_id = str(task["_id"])
-                
-                # Skip if task has too many errors
-                if self._error_counts.get(task_id, 0) >= 3:
-                    print(f"⚠️ Worker {self._worker_id}: Task {task_id} has too many errors, marking as failed")
-                    await self._mark_task_failed(task_id, "Too many processing attempts")
-                    # Release the claim
-                    await self._release_task_claim(task_id)
-                    continue
-
-                try:
-                    # Double-check task is still valid
-                    current_task = await self.db.tasks.find_one({
-                        "_id": ObjectId(task_id),
-                        "status": "running",
-                        "workerClaim.workerId": self._worker_id
-                    })
+                # ── 3. If none found, check for paused tasks and idle ──────────
+                if not tasks:
+                    # Check for paused tasks periodically
+                    if now_ts - last_paused_log > 60:  # Log every 60 seconds
+                        paused_tasks = await self.db.tasks.count_documents({"status": "paused"})
+                        if paused_tasks > 0:
+                            print(f"⏸️  {paused_tasks} task(s) in paused state, waiting for full-screening request...")
+                            last_paused_log = now_ts
                     
-                    if not current_task:
-                        print(f"Worker {self._worker_id}: Task {task_id} no longer available")
+                    await asyncio.sleep(self._config_check_interval)
+                    continue
+
+                # ── 4. Process each eligible task ────────────────────────────
+                for task in tasks:
+                    if self._shutdown.is_set():
+                        break
+
+                    task_id = str(task["_id"])
+                    
+                    # Skip if already processing
+                    if task_id in self._processing_tasks:
                         continue
 
-                    # Mark task as being processed
-                    self._processing_tasks.add(task_id)
-                    self.current_task = task_id
+                    # Skip if too many errors
+                    if self._error_counts.get(task_id, 0) >= 3:
+                        print(f"⚠️ Task {task_id} has too many errors, marking as failed")
+                        await self._mark_task_failed(task_id, "Too many processing attempts")
+                        continue
 
-                    print(f"📝 Worker {self._worker_id} processing task: {task_id}")
-                    
-                    # Create a task processor for this specific task
-                    processor = TaskProcessor(self.db)
-                    self._active_processors[task_id] = processor
-                    
-                    await processor.process(task_id)
-
-                except asyncio.CancelledError:
-                    print(f"🛑 Worker {self._worker_id}: Processing cancelled for task {task_id}")
-                    raise
-                except Exception as e:
-                    print(f"❌ Worker {self._worker_id} error processing task {task_id}: {e}")
-                    # Increment error count
-                    self._error_counts[task_id] = self._error_counts.get(task_id, 0) + 1
-                    
-                    if self._error_counts[task_id] >= 3:
-                        await self._mark_task_failed(task_id, str(e))
-                    else:
-                        # Mark as error but allow retry
-                        await self.db.tasks.update_one(
-                            {"_id": ObjectId(task_id)},
-                            {
-                                "$set": {
-                                    "status": "error",
-                                    "error": f"Attempt {self._error_counts[task_id]}: {str(e)}",
-                                    "completedAt": datetime.utcnow()
-                                },
-                                "$unset": {
-                                    "workerClaim": ""
-                                }
-                            }
+                    try:
+                        # Double‑check status still valid
+                        current = await self.db.tasks.find_one(
+                            {"_id": ObjectId(task_id), "status": {"$in": ["running", "full_screening"]}}
                         )
-                finally:
-                    # Clean up
-                    self._processing_tasks.discard(task_id)
-                    self._active_processors.pop(task_id, None)
-                    if self.current_task == task_id:
-                        self.current_task = None
-                    # Release the claim
-                    await self._release_task_claim(task_id)
+                        if not current:
+                            continue
 
-            except asyncio.CancelledError:
-                print(f"🛑 Worker {self._worker_id} cancelled")
-                break
-            except Exception as e:
-                print(f"❌ Worker {self._worker_id} error: {e}")
+                        # Mark as processing
+                        self._processing_tasks.add(task_id)
+                        self.current_task = task_id
+                        
+                        print(f"\n📝 Worker {id(self)} processing task: {task_id}")
+                        print(f"   Status: {current['status']}")
+                        print(f"   Progress: {current.get('progress', {})}")
+                        
+                        # Ensure initialization before each task (safety check)
+                        if not self._initialized:
+                            print("⚙️ Initializing components before processing task...")
+                            await self.task_processor.screening_service.llm_service.initialize()
+                            self._initialized = True
+                        
+                        # Process the task
+                        await self.task_processor.process(task_id)
+                        
+                        # Reset error count on successful processing
+                        self._error_counts.pop(task_id, None)
+
+                        # Check final status
+                        final_task = await self.db.tasks.find_one({"_id": ObjectId(task_id)})
+                        if final_task:
+                            final_status = final_task.get("status")
+                            if final_status == "paused":
+                                print(f"✅ Task {task_id} successfully paused")
+                                print(f"   Progress: {final_task.get('progress', {})}")
+                            elif final_status == "done":
+                                print(f"✅ Task {task_id} completed successfully")
+                            elif final_status == "error":
+                                print(f"❌ Task {task_id} ended with error: {final_task.get('error')}")
+
+                    except Exception as e:
+                        print(f"❌ Error processing task {task_id}: {e}")
+                        self._error_counts[task_id] = self._error_counts.get(task_id, 0) + 1
+                        
+                        if self._error_counts[task_id] >= 3:
+                            await self._mark_task_failed(task_id, str(e))
+                        else:
+                            await self.db.tasks.update_one(
+                                {"_id": ObjectId(task_id)},
+                                {
+                                    "$set": {
+                                        "status": "error",
+                                        "error": f"Attempt {self._error_counts[task_id]}: {e}",
+                                        "completedAt": datetime.utcnow(),
+                                    }
+                                },
+                            )
+                    finally:
+                        # Clean up
+                        self._processing_tasks.discard(task_id)
+                        if self.current_task == task_id:
+                            self.current_task = None
+
+                # Small delay before next check
+                await asyncio.sleep(1)
+
+            except Exception as loop_err:
+                print(f"❌ Worker loop error: {loop_err}")
                 await asyncio.sleep(5)
 
-        print(f"👋 Worker {self._worker_id} stopped")
+        print("👋 Worker stopped")
 
     async def stop(self):
-        """Stop the worker process gracefully"""
-        print(f"🛑 Stopping worker {self._worker_id}...")
+        """Gracefully stop the worker."""
+        print("🛑 Stopping worker...")
         self._shutdown.set()
         self.running = False
-        
-        # Cancel all active processors
-        for task_id, processor in list(self._active_processors.items()):
-            print(f"🔄 Worker {self._worker_id} cancelling task: {task_id}")
+
+        # Clean up resources
+        try:
+            await self.task_processor.screening_service.llm_service.cleanup()
+            print("✅ LLM service cleaned up")
+        except Exception as e:
+            print(f"⚠️ Error cleaning up LLM service: {e}")
+
+        # Cancel any tasks in progress
+        for task_id in list(self._processing_tasks):
+            print(f"🔄 Cancelling task: {task_id}")
+            self.task_processor.cancel()
             
-            # Stop task processor
-            processor.cancel()
-            
-            # Mark task as error and release claim
             await self.db.tasks.update_one(
                 {"_id": ObjectId(task_id)},
                 {
                     "$set": {
                         "status": "error",
-                        "error": f"Worker {self._worker_id} stopped",
-                        "completedAt": datetime.utcnow()
-                    },
-                    "$unset": {
-                        "workerClaim": "",
-                        "processingLock": ""
+                        "error": "Worker stopped",
+                        "completedAt": datetime.utcnow(),
                     }
-                }
+                },
             )
-            
-            print(f"🧹 Worker {self._worker_id} stopped task {task_id}")
+            print(f"🧹 Stopped task {task_id}")
             self._processing_tasks.discard(task_id)
 
-    async def _release_task_claim(self, task_id: str):
-        """Release the worker's claim on a task"""
-        try:
-            await self.db.tasks.update_one(
-                {
-                    "_id": ObjectId(task_id),
-                    "workerClaim.workerId": self._worker_id
-                },
-                {
-                    "$unset": {"workerClaim": ""}
-                }
-            )
-        except Exception as e:
-            print(f"Error releasing task claim: {e}")
-
     async def _mark_task_failed(self, task_id: str, error_message: str):
-        """Mark a task as permanently failed"""
+        """Mark a task as permanently failed."""
         try:
             await self.db.tasks.update_one(
                 {"_id": ObjectId(task_id)},
@@ -205,16 +220,11 @@ class Worker:
                     "$set": {
                         "status": "error",
                         "error": f"Task failed permanently: {error_message}",
-                        "completedAt": datetime.utcnow()
-                    },
-                    "$unset": {
-                        "workerClaim": "",
-                        "processingLock": ""
+                        "completedAt": datetime.utcnow(),
                     }
-                }
+                },
             )
-            # Clean up error tracking
             self._error_counts.pop(task_id, None)
-            print(f"❌ Worker {self._worker_id}: Task {task_id} marked as permanently failed")
+            print(f"❌ Task {task_id} marked as permanently failed")
         except Exception as e:
             print(f"Error marking task as failed: {e}")

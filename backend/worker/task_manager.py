@@ -44,7 +44,7 @@ class TaskManager:
         """Finalize task status"""
         print(f"\n🏁 Finalizing task {task_id}")
         
-        # Get task to verify totals and get actual progress from DB
+        # Get task to verify totals
         task = await self.load_task(task_id)
         if not task:
             print("❌ Task not found during finalization")
@@ -66,30 +66,35 @@ class TaskManager:
             print("✅ Task already paused, no changes needed")
             return
         
-        # Determine final status based on current status and progress
+        # Determine final status
         if current_status == "full_screening":
+            # Full screening completed
             final_status = "done"
             completion_time = datetime.utcnow()
+            print(f"✅ Full screening completed - {final_processed} articles processed")
         elif current_status == "running":
-            # Check against the limit, not total articles
+            # Initial screening - should have been paused in the processor
+            # This is a fallback
             if final_processed >= settings.ARTICLE_LIMIT:
                 final_status = "paused"
                 completion_time = None
-                print(f"⏸️ Setting status to paused (processed: {final_processed}, limit: {settings.ARTICLE_LIMIT})")
+                print(f"⏸️ Initial screening completed - pausing at {final_processed} articles")
             else:
-                # Only mark as done if we processed all available articles
+                # Check if we processed all available articles
                 total_articles = await self.db.articles.count_documents({"taskId": task_id})
                 if final_processed >= total_articles:
                     final_status = "done"
                     completion_time = datetime.utcnow()
+                    print(f"✅ All articles processed - {final_processed} articles")
                 else:
-                    # Still have articles but stopped for some reason
+                    # Unexpected state
                     final_status = "paused"
                     completion_time = None
+                    print(f"⚠️ Unexpected state - pausing at {final_processed} articles")
         else:
-            # Preserve current status if not running/full_screening
-            final_status = current_status
-            completion_time = datetime.utcnow() if final_status == "done" else None
+            # Unknown status
+            print(f"⚠️ Unknown status: {current_status}")
+            return
 
         # Update task
         update = {
@@ -98,41 +103,22 @@ class TaskManager:
             "progress.current": final_processed
         }
 
-        # For initial screening that reaches limit, ensure total is set correctly
-        if final_status == "paused" and current_status == "running":
-            update["progress.total"] = settings.ARTICLE_LIMIT
-
         if completion_time:
             update["completedAt"] = completion_time
 
-        # Use atomic update to ensure we only update if status hasn't changed
-        result = await self.db.tasks.update_one(
-            {
-                "_id": ObjectId(task_id),
-                "status": {"$ne": "paused"}  # Don't update if already paused
-            },
+        await self.db.tasks.update_one(
+            {"_id": ObjectId(task_id)},
             {"$set": update}
         )
 
-        if result.modified_count == 1:
-            print(f"✅ Task {task_id} marked as {final_status}")
-            print(f"Final progress: {final_processed}/{task.get('progress', {}).get('total', 0)} articles")
-        else:
-            print(f"⚠️ Task {task_id} status was already updated, no changes made")
-            # Re-load task to log current status
-            current_task = await self.load_task(task_id)
-            if current_task:
-                print(f"Current task status is: {current_task.get('status', 'unknown')}")
-                print(f"Current progress: {current_task.get('progress', {})}")
+        print(f"✅ Task {task_id} finalized as {final_status}")
+        print(f"   Final progress: {final_processed} articles")
 
     async def mark_task_error(self, task_id: str, error_message: str):
         """Mark task as error with message"""
         print(f"\n❌ Marking task {task_id} as error: {error_message}")
-        result = await self.db.tasks.update_one(
-            {
-                "_id": ObjectId(task_id),
-                "status": {"$nin": ["done"]}  # Don't override done status
-            },
+        await self.db.tasks.update_one(
+            {"_id": ObjectId(task_id)},
             {
                 "$set": {
                     "status": "error",
@@ -142,9 +128,3 @@ class TaskManager:
                 }
             }
         )
-        
-        if result.modified_count == 0:
-            print(f"⚠️ Could not update task {task_id} to error state - status may have been changed externally")
-            current_task = await self.load_task(task_id)
-            if current_task:
-                print(f"Current task status is: {current_task.get('status', 'unknown')}")
